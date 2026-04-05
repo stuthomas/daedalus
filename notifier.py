@@ -221,8 +221,7 @@ def send_cycle_summary(
     sign = "+" if pl_abs >= 0 else ""
     _send(config, f"Cycle Report — ${total:.2f} AUD ({sign}{pl_pct:.1f}%)", html)
 
-
-def _stat_block(label: str, value: str, sub: str | None, colour: str | None) -> str:
+def _stat_block(label: str, value: str, sub: str | None = None, colour: str | None = None) -> str:
     val_style = f"color:{colour};" if colour else ""
     sub_html  = f'<div style="font-size:11px;color:#64748b;margin-top:2px">{sub}</div>' if sub else ""
     return f"""<div style="flex:1;padding:0 12px;border-right:1px solid #e2e8f0">
