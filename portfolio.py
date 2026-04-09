@@ -1,15 +1,11 @@
 """
 Daedalus Portfolio
-Manages portfolio state as a JSON file.
-
-Railway/Render persistence note:
-  - Railway: add a Volume mounted at /data and set PORTFOLIO_FILE=/data/portfolio.json
-  - Render:  add a Disk mounted at /data and set PORTFOLIO_FILE=/data/portfolio.json
-  Both platforms will then persist the file across deploys and restarts.
+Manages portfolio state as a JSON file on the Railway volume.
 """
 
 import json
 import logging
+import math
 import os
 from datetime import datetime
 
@@ -37,7 +33,19 @@ def _blank_portfolio(starting_capital: float) -> dict:
         "lastNews": None,
         "lastPMOutput": None,
         "startDate": today,
-        "version": "1.0",
+        # Trade memory: last N PM decisions for context injection
+        "tradeMemory": [],
+        # Sentiment history: last N scores for trend analysis
+        "sentimentHistory": [],
+        # Cycle health tracking
+        "cycleHealth": {
+            "lastSuccess": None,
+            "lastFailure": None,
+            "successStreak": 0,
+            "totalCycles": 0,
+            "totalErrors": 0,
+        },
+        "version": "2.0",
     }
 
 
@@ -48,6 +56,13 @@ def load_portfolio(config) -> dict:
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # Migrate old portfolios missing new fields
+        data.setdefault("tradeMemory", [])
+        data.setdefault("sentimentHistory", [])
+        data.setdefault("cycleHealth", {
+            "lastSuccess": None, "lastFailure": None,
+            "successStreak": 0, "totalCycles": 0, "totalErrors": 0,
+        })
         log.debug(f"Portfolio loaded from {path}")
         return data
 
@@ -65,11 +80,54 @@ def save_portfolio(portfolio: dict, config) -> None:
     log.debug(f"Portfolio saved to {path}")
 
 
+# ── Add Funds ─────────────────────────────────────────────────────────────────
+
+def add_funds(portfolio: dict, amount: float) -> dict:
+    """
+    Add cash to the portfolio (e.g. you deposited more money).
+    Records a DEPOSIT transaction and updates history.
+    """
+    if amount <= 0:
+        return {"success": False, "error": "Amount must be positive"}
+
+    today = datetime.now(AEST).strftime("%Y-%m-%d")
+    portfolio["cash"] = round(portfolio["cash"] + amount, 4)
+    # Increase starting capital baseline so P&L is calculated correctly
+    portfolio["startingCapital"] = round(portfolio["startingCapital"] + amount, 4)
+
+    tx = {
+        "id": int(datetime.now().timestamp() * 1000),
+        "date": today,
+        "type": "DEPOSIT",
+        "ticker": "CASH",
+        "name": "Cash Deposit",
+        "shares": 0,
+        "price": 1.0,
+        "total": round(amount, 2),
+        "confidence": "",
+        "reason": f"Manual deposit of ${amount:.2f} AUD",
+        "agent": "Manual",
+        "source": "manual",
+    }
+    portfolio.setdefault("transactions", []).insert(0, tx)
+    portfolio.setdefault("logs", []).insert(0, {
+        "ts": datetime.now(AEST).isoformat(),
+        "agent": "System",
+        "type": "DEPOSIT",
+        "title": f"Funds added: ${amount:.2f} AUD",
+        "content": f"Cash balance is now ${portfolio['cash']:.2f} AUD",
+    })
+
+    log.info(f"Funds added: ${amount:.2f} AUD → cash now ${portfolio['cash']:.2f}")
+    return {"success": True, "error": None, "newCash": portfolio["cash"]}
+
+
 # ── Trade Execution ───────────────────────────────────────────────────────────
 
-def execute_trade(portfolio: dict, trade: dict) -> dict:
+def execute_trade(portfolio: dict, trade: dict, source: str = "agent") -> dict:
     """
     Execute a BUY or SELL trade against the portfolio.
+    source: "agent" | "manual"
     Returns {"success": bool, "error": str | None}.
     Modifies `portfolio` in place on success.
     """
@@ -96,6 +154,7 @@ def execute_trade(portfolio: dict, trade: dict) -> dict:
             )
             existing["shares"] = new_shares
             existing["currentPrice"] = price
+            existing["lastUpdated"] = today
         else:
             portfolio["holdings"].append({
                 "ticker": ticker,
@@ -104,6 +163,9 @@ def execute_trade(portfolio: dict, trade: dict) -> dict:
                 "avgBuyPrice": price,
                 "currentPrice": price,
                 "purchaseDate": today,
+                "lastUpdated": today,
+                "source": source,        # "agent" or "manual"
+                "priceHistory": [{"date": today, "price": price}],
             })
 
     elif action == "SELL":
@@ -112,18 +174,26 @@ def execute_trade(portfolio: dict, trade: dict) -> dict:
             return {"success": False, "error": f"No holding found for {ticker}"}
 
         selling = min(shares, existing["shares"])
-        portfolio["cash"] = round(portfolio["cash"] + selling * price, 4)
+        proceeds = round(selling * price, 4)
+        portfolio["cash"] = round(portfolio["cash"] + proceeds, 4)
 
         if existing["shares"] - selling <= 0:
             portfolio["holdings"] = [h for h in portfolio["holdings"] if h["ticker"] != ticker]
         else:
             existing["shares"] -= selling
             existing["currentPrice"] = price
+            existing["lastUpdated"] = today
 
     else:
         return {"success": False, "error": f"Unknown action: {action}"}
 
     # ── Record transaction ──────────────────────────────────────────────────
+    agent_label = trade.get("agent", "Portfolio Manager")
+    if source == "manual":
+        agent_label = "Manual"
+    elif trade.get("autoApproved"):
+        agent_label = "Portfolio Manager (Auto-approved)"
+
     tx = {
         "id": int(datetime.now().timestamp() * 1000),
         "date": today,
@@ -135,15 +205,17 @@ def execute_trade(portfolio: dict, trade: dict) -> dict:
         "total": round(total, 2),
         "confidence": trade.get("confidence", ""),
         "reason": trade.get("reason", ""),
-        "agent": "Portfolio Manager (Auto-approved)" if trade.get("autoApproved") else "Portfolio Manager",
+        "agent": agent_label,
+        "source": source,
+        "stopLoss": trade.get("stopLoss", False),
     }
     portfolio.setdefault("transactions", []).insert(0, tx)
 
-    # ── Agent log entry ─────────────────────────────────────────────────────
+    log_type = "STOP_LOSS" if trade.get("stopLoss") else "EXECUTED"
     portfolio.setdefault("logs", []).insert(0, {
         "ts": datetime.now(AEST).isoformat(),
-        "agent": "Portfolio Manager",
-        "type": "EXECUTED",
+        "agent": agent_label,
+        "type": log_type,
         "title": f"{action} {shares}× {ticker} @ ${price:.2f}",
         "content": trade.get("reason", ""),
     })
@@ -151,11 +223,91 @@ def execute_trade(portfolio: dict, trade: dict) -> dict:
     return {"success": True, "error": None}
 
 
+# ── Stop-Loss Checker ─────────────────────────────────────────────────────────
+
+def check_stop_losses(portfolio: dict, config) -> list[dict]:
+    """
+    Check all holdings against the stop-loss threshold.
+    Returns list of stop-loss trades that were executed.
+    Does NOT save the portfolio — caller must call save_portfolio().
+    """
+    if config.STOP_LOSS_PCT <= 0:
+        return []
+
+    triggered = []
+    for holding in list(portfolio["holdings"]):
+        current = holding.get("currentPrice", holding["avgBuyPrice"])
+        drop_pct = (holding["avgBuyPrice"] - current) / holding["avgBuyPrice"]
+
+        if drop_pct >= config.STOP_LOSS_PCT:
+            trade = {
+                "ticker": holding["ticker"],
+                "name": holding["name"],
+                "action": "SELL",
+                "shares": holding["shares"],
+                "price": current,
+                "total": round(holding["shares"] * current, 2),
+                "confidence": "HIGH",
+                "reason": (
+                    f"Stop-loss triggered: position dropped {drop_pct*100:.1f}% "
+                    f"from avg buy ${holding['avgBuyPrice']:.2f} to ${current:.2f} "
+                    f"(threshold: {config.STOP_LOSS_PCT*100:.0f}%)"
+                ),
+                "stopLoss": True,
+            }
+            result = execute_trade(portfolio, trade, source=holding.get("source", "agent"))
+            if result["success"]:
+                triggered.append(trade)
+                log.warning(
+                    f"STOP-LOSS: Sold {holding['shares']}× {holding['ticker']} "
+                    f"@ ${current:.2f} (dropped {drop_pct*100:.1f}%)"
+                )
+            else:
+                log.error(f"Stop-loss sell failed for {holding['ticker']}: {result['error']}")
+
+    return triggered
+
+
+# ── Price Update ──────────────────────────────────────────────────────────────
+
+def update_holding_prices(portfolio: dict, analyst_data: dict) -> None:
+    """
+    Update currentPrice for any holding mentioned in analyst recommendations.
+    Also appends to priceHistory for volatility calculation.
+    """
+    recs = analyst_data.get("recs") or []
+    price_map = {r["t"]: r["price"] for r in recs if r.get("price")}
+    today = datetime.now(AEST).strftime("%Y-%m-%d")
+
+    for holding in portfolio["holdings"]:
+        ticker = holding["ticker"]
+        if ticker in price_map:
+            new_price = price_map[ticker]
+            holding["currentPrice"] = new_price
+            holding["lastUpdated"] = today
+
+            # Maintain rolling price history (last 30 data points)
+            history = holding.setdefault("priceHistory", [])
+            if not history or history[-1]["date"] != today:
+                history.append({"date": today, "price": new_price})
+            else:
+                history[-1]["price"] = new_price  # update today's entry
+            holding["priceHistory"] = history[-30:]
+
+            # Calculate simple volatility (std dev of daily returns)
+            if len(history) >= 3:
+                prices = [p["price"] for p in history]
+                returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
+                mean = sum(returns) / len(returns)
+                variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+                holding["volatility"] = round(math.sqrt(variance) * 100, 2)  # % per period
+
+
 # ── History Snapshot ──────────────────────────────────────────────────────────
 
 def snapshot_history(portfolio: dict) -> None:
     """Add or update today's value entry in portfolio history."""
-    today  = datetime.now(AEST).strftime("%Y-%m-%d")
+    today    = datetime.now(AEST).strftime("%Y-%m-%d")
     invested = sum(
         h["shares"] * h.get("currentPrice", h["avgBuyPrice"])
         for h in portfolio.get("holdings", [])
