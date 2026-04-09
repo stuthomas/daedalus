@@ -54,10 +54,32 @@ def _call_claude(client: Anthropic, model: str, system: str, prompt: str, use_se
                 time.sleep(15)
                 continue
 
-            # Strip any accidental markdown fences
+            # Strip markdown fences, then extract the JSON object/array
+            # from within any surrounding prose.
             clean = raw_text.replace("```json", "").replace("```", "").strip()
+
+            # Find the outermost JSON object or array
+            start = next((i for i, c in enumerate(clean) if c in "{["), None)
+            end_brace = clean.rfind("}")
+            end_bracket = clean.rfind("]")
+            end = max(end_brace, end_bracket)
+
+            if start is not None and end > start:
+                clean = clean[start:end + 1]
+
+            if not clean:
+                log.warning(f"No JSON found in response on attempt {attempt + 1}, retrying in 15s…")
+                time.sleep(15)
+                continue
+
             return json.loads(clean)
 
+        except json.JSONDecodeError as e:
+            log.warning(f"JSON parse error on attempt {attempt + 1}: {e}, retrying in 15s…")
+            if attempt < 2:
+                time.sleep(15)
+            else:
+                raise RuntimeError(f"Could not parse JSON after 3 attempts. Last text: {raw_text[:200]}")
         except Exception as e:
             if "rate_limit" in str(e).lower() or "429" in str(e):
                 wait = 20 * (attempt + 1)
@@ -324,10 +346,10 @@ def run_cycle(config: Config) -> None:
         errors.append(f"Analyst: {exc}")
 
     # ── Step 2: News Intelligence ─────────────────────────────────────────
-    # Brief pause to avoid hitting the 50k tokens/min rate limit on Haiku
-    # since the Analyst's web search results are token-heavy.
-    log.info("Pausing 20s between agents to respect rate limits…")
-    time.sleep(20)
+    # Wait 65s (>1 full minute) so the Analyst's web search tokens fully
+    # roll out of the rate-limit window before News fires.
+    log.info("Pausing 65s between agents to respect rate limits…")
+    time.sleep(65)
 
     try:
         news_data = run_news_agent(client, config, portfolio)
