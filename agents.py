@@ -33,7 +33,7 @@ def _call_claude(client: Anthropic, model: str, system: str, prompt: str, use_se
     """
     kwargs = {
         "model": model,
-        "max_tokens": 1000,
+        "max_tokens": 4000,
         "system": system,
         "messages": [{"role": "user", "content": prompt}],
     }
