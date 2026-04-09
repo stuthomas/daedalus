@@ -9,6 +9,7 @@ Three Claude-powered agents that work together each market-hours cycle.
 
 import json
 import logging
+import time
 from datetime import datetime
 
 import pytz
@@ -25,7 +26,11 @@ AEST = pytz.timezone("Australia/Sydney")
 # ── Shared Claude caller ──────────────────────────────────────────────────────
 
 def _call_claude(client: Anthropic, model: str, system: str, prompt: str, use_search: bool = True) -> dict:
-    """Call Claude, optionally with web_search, and parse the JSON response."""
+    """
+    Call Claude, optionally with web_search, and parse the JSON response.
+    Retries up to 3 times if the response has no text block (can happen when
+    web search consumes the full context window) or hits a rate limit.
+    """
     kwargs = {
         "model": model,
         "max_tokens": 1000,
@@ -35,15 +40,33 @@ def _call_claude(client: Anthropic, model: str, system: str, prompt: str, use_se
     if use_search:
         kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
 
-    response = client.messages.create(**kwargs)
+    for attempt in range(3):
+        try:
+            response = client.messages.create(**kwargs)
 
-    # Collect all text blocks (search results are separate block types)
-    raw_text = "".join(b.text for b in response.content if b.type == "text")
+            # Collect all text blocks (search results are separate block types)
+            raw_text = "".join(b.text for b in response.content if b.type == "text")
 
-    # Strip any accidental markdown fences
-    clean = raw_text.replace("```json", "").replace("```", "").strip()
+            if not raw_text.strip():
+                # Model returned tool-use blocks only — no synthesised JSON yet.
+                # Wait and retry so the rate-limit window resets.
+                log.warning(f"Empty text response on attempt {attempt + 1}, retrying in 15s…")
+                time.sleep(15)
+                continue
 
-    return json.loads(clean)
+            # Strip any accidental markdown fences
+            clean = raw_text.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean)
+
+        except Exception as e:
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                wait = 20 * (attempt + 1)
+                log.warning(f"Rate limited on attempt {attempt + 1}, waiting {wait}s…")
+                time.sleep(wait)
+            elif attempt < 2:
+                raise  # Non-rate-limit errors bubble up immediately
+
+    raise RuntimeError("All retries exhausted — no valid JSON response from Claude")
 
 
 # ── Agent 1: Corporate Analyst (Haiku) ────────────────────────────────────────
@@ -301,6 +324,11 @@ def run_cycle(config: Config) -> None:
         errors.append(f"Analyst: {exc}")
 
     # ── Step 2: News Intelligence ─────────────────────────────────────────
+    # Brief pause to avoid hitting the 50k tokens/min rate limit on Haiku
+    # since the Analyst's web search results are token-heavy.
+    log.info("Pausing 20s between agents to respect rate limits…")
+    time.sleep(20)
+
     try:
         news_data = run_news_agent(client, config, portfolio)
         portfolio["lastNews"] = news_data
