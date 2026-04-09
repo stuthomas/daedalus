@@ -35,7 +35,7 @@ AEST = pytz.timezone("Australia/Sydney")
 
 # ── Flask API ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app)          # Allow the dashboard artifact to call this API
+CORS(app, resources={r"/*": {"origins": "*", "allow_headers": ["X-API-Key", "Content-Type"], "methods": ["GET", "POST", "OPTIONS"]}})         # Allow the dashboard artifact to call this API
 _config: Config = None
 
 
