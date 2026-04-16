@@ -124,10 +124,12 @@ def add_funds(portfolio: dict, amount: float) -> dict:
 
 # ── Trade Execution ───────────────────────────────────────────────────────────
 
-def execute_trade(portfolio: dict, trade: dict, source: str = "agent") -> dict:
+def execute_trade(portfolio: dict, trade: dict, source: str = "agent",
+                  min_shares: int = 0) -> dict:
     """
     Execute a BUY or SELL trade against the portfolio.
     source: "agent" | "manual"
+    min_shares: minimum shares per BUY trade (0 = no minimum, set from config.MIN_TRADE_SHARES)
     Returns {"success": bool, "error": str | None}.
     Modifies `portfolio` in place on success.
     """
@@ -137,6 +139,13 @@ def execute_trade(portfolio: dict, trade: dict, source: str = "agent") -> dict:
     price  = float(trade["price"])
     total  = round(shares * price, 4)
     today  = datetime.now(AEST).strftime("%Y-%m-%d")
+
+    # Enforce minimum trade size for agent BUY orders (manual trades exempt)
+    if action == "BUY" and source == "agent" and min_shares > 0 and shares < min_shares:
+        return {
+            "success": False,
+            "error": f"Below minimum trade size: {shares} shares < {min_shares} minimum",
+        }
 
     if action == "BUY":
         if total > portfolio["cash"] + 0.01:

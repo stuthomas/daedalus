@@ -78,6 +78,10 @@ def status():
         "scheduledCycles": [f"{h:02d}:00 AEST Mon–Fri" for h in _config.CYCLE_HOURS],
         "cycleHealth": portfolio.get("cycleHealth", {}),
         "stopLossPct": _config.STOP_LOSS_PCT,
+        "trailingStopPct": _config.TRAILING_STOP_PCT,
+        "takeProfitPct": _config.TAKE_PROFIT_PCT,
+        "minTradeShares": _config.MIN_TRADE_SHARES,
+        "riskHealthScore": (portfolio.get("lastRiskReport") or {}).get("healthScore"),
     })
 
 
@@ -184,11 +188,17 @@ def get_config():
     """Return editable configuration values."""
     return jsonify({
         "stopLossPct": _config.STOP_LOSS_PCT,
+        "trailingStopPct": _config.TRAILING_STOP_PCT,
+        "takeProfitPct": _config.TAKE_PROFIT_PCT,
+        "maxPositionPct": _config.MAX_POSITION_PCT,
+        "maxSectorPct": _config.MAX_SECTOR_PCT,
         "cashBufferPct": _config.CASH_BUFFER_PCT,
         "autoApproveTrades": _config.AUTO_APPROVE_TRADES,
         "autoApproveMinConfidence": _config.AUTO_APPROVE_MIN_CONFIDENCE,
         "cycleHours": _config.CYCLE_HOURS,
         "tradeMemorySize": _config.TRADE_MEMORY_SIZE,
+        "minTradeShares": _config.MIN_TRADE_SHARES,
+        "pendingTradeExpiryHours": _config.PENDING_TRADE_EXPIRY_HOURS,
     })
 
 
@@ -214,6 +224,10 @@ def main():
     log.info(f"  PM model         : {_config.PM_MODEL}  (Sonnet)")
     log.info(f"  Auto-approve     : {_config.AUTO_APPROVE_TRADES}")
     log.info(f"  Stop-loss        : {_config.STOP_LOSS_PCT*100:.0f}%")
+    log.info(f"  Trailing stop    : {_config.TRAILING_STOP_PCT*100:.0f}%")
+    log.info(f"  Take-profit      : {_config.TAKE_PROFIT_PCT*100:.0f}%")
+    log.info(f"  Min trade shares : {_config.MIN_TRADE_SHARES}")
+    log.info(f"  Max position     : {_config.MAX_POSITION_PCT*100:.0f}%")
     log.info(f"  Notify email     : {_config.NOTIFY_EMAIL or 'not configured'}")
 
     port = int(os.getenv("PORT", 8080))

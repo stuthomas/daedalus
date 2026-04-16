@@ -28,6 +28,24 @@ class Config:
     # Set to 0.0 to disable. Change via STOP_LOSS_PCT env var.
     STOP_LOSS_PCT: float = float(os.getenv("STOP_LOSS_PCT", "0.06"))  # 6%
 
+    # Trailing stop-loss: sell if price drops this % from its PEAK (not buy price)
+    TRAILING_STOP_PCT: float = float(os.getenv("TRAILING_STOP_PCT", "0.10"))  # 10%
+
+    # Take-profit threshold: flag positions up this % from buy for profit-taking
+    TAKE_PROFIT_PCT: float = float(os.getenv("TAKE_PROFIT_PCT", "0.25"))  # 25%
+
+    # Maximum single position as % of total portfolio value
+    MAX_POSITION_PCT: float = float(os.getenv("MAX_POSITION_PCT", "0.25"))  # 25%
+
+    # Maximum single sector as % of total portfolio value
+    MAX_SECTOR_PCT: float = float(os.getenv("MAX_SECTOR_PCT", "0.40"))  # 40%
+
+    # Minimum number of shares per trade — avoids trivial 1-2 share positions
+    MIN_TRADE_SHARES: int = int(os.getenv("MIN_TRADE_SHARES", "50"))
+
+    # Pending trades expire after this many hours
+    PENDING_TRADE_EXPIRY_HOURS: float = float(os.getenv("PENDING_TRADE_EXPIRY_HOURS", "8"))
+
     # Past PM decisions injected into PM context for trade memory
     TRADE_MEMORY_SIZE: int = int(os.getenv("TRADE_MEMORY_SIZE", "10"))
 
