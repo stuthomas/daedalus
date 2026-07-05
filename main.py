@@ -10,14 +10,25 @@ import signal
 from datetime import datetime
 
 import pytz
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
 from config import Config
 from agents import run_cycle
-from portfolio import load_portfolio, save_portfolio, add_funds, execute_trade
+from portfolio import (
+    load_portfolio, save_portfolio, add_funds, execute_trade,
+    snapshot_history, add_notification, win_rate,
+)
+
+# Windows consoles default to cp1252 and choke on the Unicode banner/arrows;
+# force UTF-8 on the console streams so logging never raises UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +40,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("daedalus")
 AEST = pytz.timezone("Australia/Sydney")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {
@@ -48,6 +60,26 @@ def _require_api_key():
     return None
 
 
+def _find_pending(portfolio: dict, data: dict):
+    """Locate a pending trade by explicit index or ticker."""
+    pending = portfolio.get("pendingTrades", [])
+    idx = data.get("index")
+    if isinstance(idx, int) and 0 <= idx < len(pending):
+        return pending[idx]
+    ticker = str(data.get("ticker", "")).upper()
+    if ticker:
+        return next((t for t in pending if str(t.get("ticker", "")).upper() == ticker), None)
+    return None
+
+
+# ── Dashboard (served locally, same-origin) ─────────────────────────────────────
+
+@app.route("/")
+@app.route("/dashboard")
+def dashboard():
+    return send_from_directory(BASE_DIR, "index.html")
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "service": "daedalus"})
@@ -64,6 +96,8 @@ def status():
     pl = total - portfolio["startingCapital"]
     now = datetime.now(AEST)
     market_open = now.weekday() < 5 and 10 <= now.hour < 16
+    wr = win_rate(portfolio)
+    regime = portfolio.get("lastRegime") or {}
 
     return jsonify({
         "status": "running",
@@ -75,12 +109,24 @@ def status():
         "pl": round(pl, 2),
         "plPct": round((pl / portfolio["startingCapital"]) * 100, 2),
         "holdings": len(portfolio.get("holdings", [])),
+        "pendingTrades": len(portfolio.get("pendingTrades", [])),
         "scheduledCycles": [f"{h:02d}:00 AEST Mon–Fri" for h in _config.CYCLE_HOURS],
         "cycleHealth": portfolio.get("cycleHealth", {}),
         "stopLossPct": _config.STOP_LOSS_PCT,
         "trailingStopPct": _config.TRAILING_STOP_PCT,
         "takeProfitPct": _config.TAKE_PROFIT_PCT,
-        "minTradeShares": _config.MIN_TRADE_SHARES,
+        "minTradeValue": _config.MIN_TRADE_VALUE,
+        "autoApprove": _config.AUTO_APPROVE_TRADES,
+        "autoApproveMinConfidence": _config.AUTO_APPROVE_MIN_CONFIDENCE,
+        "winRate": wr["winRate"],
+        "wins": wr["wins"],
+        "losses": wr["losses"],
+        "realizedPnL": wr["realizedPnL"],
+        "regime": {
+            "signal": regime.get("signal"),
+            "posture": regime.get("posture"),
+            "headline": regime.get("headline"),
+        } if regime.get("available") else None,
         "riskHealthScore": (portfolio.get("lastRiskReport") or {}).get("healthScore"),
     })
 
@@ -125,7 +171,6 @@ def api_add_funds():
     portfolio = load_portfolio(_config)
     result = add_funds(portfolio, amount)
     if result["success"]:
-        from portfolio import snapshot_history
         snapshot_history(portfolio)
         save_portfolio(portfolio, _config)
         return jsonify({
@@ -172,7 +217,6 @@ def api_manual_trade():
     result = execute_trade(portfolio, trade, source="manual")
 
     if result["success"]:
-        from portfolio import snapshot_history
         snapshot_history(portfolio)
         save_portfolio(portfolio, _config)
         return jsonify({
@@ -183,6 +227,53 @@ def api_manual_trade():
     return jsonify({"error": result["error"]}), 400
 
 
+@app.route("/api/portfolio/approve-trade", methods=["POST"])
+def api_approve_trade():
+    """Approve a pending trade. Body: {"ticker": "BHP.AX"} or {"index": 0}"""
+    err = _require_api_key()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    portfolio = load_portfolio(_config)
+    trade = _find_pending(portfolio, data)
+    if not trade:
+        return jsonify({"error": "Pending trade not found"}), 404
+
+    # Investor explicitly approved — don't re-gate on the minimum trade value.
+    result = execute_trade(portfolio, trade, source="agent", min_value=0.0)
+    if not result["success"]:
+        return jsonify({"error": result["error"]}), 400
+
+    portfolio["pendingTrades"] = [t for t in portfolio.get("pendingTrades", []) if t is not trade]
+    add_notification(portfolio, "TRADE",
+                     f"Approved: {trade['action']} {trade['shares']}× {trade['ticker']}",
+                     trade.get("reason", ""))
+    snapshot_history(portfolio)
+    save_portfolio(portfolio, _config)
+    return jsonify({"success": True, "trade": trade, "newCash": round(portfolio["cash"], 2)})
+
+
+@app.route("/api/portfolio/reject-trade", methods=["POST"])
+def api_reject_trade():
+    """Reject/discard a pending trade. Body: {"ticker": "BHP.AX"} or {"index": 0}"""
+    err = _require_api_key()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    portfolio = load_portfolio(_config)
+    trade = _find_pending(portfolio, data)
+    if not trade:
+        return jsonify({"error": "Pending trade not found"}), 404
+
+    portfolio["pendingTrades"] = [t for t in portfolio.get("pendingTrades", []) if t is not trade]
+    add_notification(portfolio, "INFO",
+                     f"Rejected: {trade['action']} {trade['shares']}× {trade['ticker']}", "")
+    save_portfolio(portfolio, _config)
+    return jsonify({"success": True})
+
+
 @app.route("/api/config", methods=["GET"])
 def get_config():
     """Return editable configuration values."""
@@ -190,6 +281,7 @@ def get_config():
         "stopLossPct": _config.STOP_LOSS_PCT,
         "trailingStopPct": _config.TRAILING_STOP_PCT,
         "takeProfitPct": _config.TAKE_PROFIT_PCT,
+        "takeProfitTrimPct": _config.TAKE_PROFIT_TRIM_PCT,
         "maxPositionPct": _config.MAX_POSITION_PCT,
         "maxSectorPct": _config.MAX_SECTOR_PCT,
         "cashBufferPct": _config.CASH_BUFFER_PCT,
@@ -197,7 +289,8 @@ def get_config():
         "autoApproveMinConfidence": _config.AUTO_APPROVE_MIN_CONFIDENCE,
         "cycleHours": _config.CYCLE_HOURS,
         "tradeMemorySize": _config.TRADE_MEMORY_SIZE,
-        "minTradeShares": _config.MIN_TRADE_SHARES,
+        "minTradeValue": _config.MIN_TRADE_VALUE,
+        "asxIndexSymbol": _config.ASX_INDEX_SYMBOL,
         "pendingTradeExpiryHours": _config.PENDING_TRADE_EXPIRY_HOURS,
     })
 
@@ -221,14 +314,14 @@ def main():
     log.info(f"  Starting capital : ${_config.STARTING_CAPITAL:,.2f} AUD")
     log.info(f"  Analyst model    : {_config.ANALYST_MODEL}  (Haiku)")
     log.info(f"  News model       : {_config.NEWS_MODEL}  (Haiku)")
-    log.info(f"  PM model         : {_config.PM_MODEL}  (Sonnet)")
-    log.info(f"  Auto-approve     : {_config.AUTO_APPROVE_TRADES}")
+    log.info(f"  PM model         : {_config.PM_MODEL}  (Opus)")
+    log.info(f"  Auto-approve     : {_config.AUTO_APPROVE_TRADES} (≥ {_config.AUTO_APPROVE_MIN_CONFIDENCE})")
     log.info(f"  Stop-loss        : {_config.STOP_LOSS_PCT*100:.0f}%")
     log.info(f"  Trailing stop    : {_config.TRAILING_STOP_PCT*100:.0f}%")
-    log.info(f"  Take-profit      : {_config.TAKE_PROFIT_PCT*100:.0f}%")
-    log.info(f"  Min trade shares : {_config.MIN_TRADE_SHARES}")
+    log.info(f"  Take-profit trim : {_config.TAKE_PROFIT_PCT*100:.0f}% → sell {_config.TAKE_PROFIT_TRIM_PCT*100:.0f}%")
+    log.info(f"  Min trade value  : ${_config.MIN_TRADE_VALUE:.0f}")
     log.info(f"  Max position     : {_config.MAX_POSITION_PCT*100:.0f}%")
-    log.info(f"  Notify email     : {_config.NOTIFY_EMAIL or 'not configured'}")
+    log.info(f"  Regime index     : {_config.ASX_INDEX_SYMBOL}")
 
     port = int(os.getenv("PORT", 8080))
     flask_thread = threading.Thread(
@@ -236,7 +329,7 @@ def main():
         daemon=True,
     )
     flask_thread.start()
-    log.info(f"  API server       : http://0.0.0.0:{port}")
+    log.info(f"  API + dashboard  : http://0.0.0.0:{port}/")
 
     scheduler = BlockingScheduler(timezone=AEST)
     scheduler.add_listener(_job_listener, EVENT_JOB_ERROR | EVENT_JOB_EXECUTED)

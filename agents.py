@@ -1,13 +1,14 @@
 """
 Daedalus Agents
-Six Claude-powered agents that work together each market-hours cycle.
+Seven agents that work together each market-hours cycle.
 
   Corporate Analyst     → claude-haiku-4-5  (web search, free-range market discovery)
   News Intelligence     → claude-haiku-4-5  (web search, market news + sentiment)
   Technical Analyst     → local only        (Yahoo Finance price data + indicators)
+  Market Regime         → local only        (ASX200 regime + 'safe to enter today')
   Earnings Calendar     → claude-haiku-4-5  (web search, upcoming events)
-  Risk / Rebalancing    → local only        (portfolio concentration + limits)
-  Portfolio Manager     → claude-sonnet-4-6 (synthesis + trade decisions, with memory)
+  Risk / Rebalancing    → local only        (concentration, trailing stop, take-profit trim)
+  Portfolio Manager     → claude-opus-4-8   (synthesis + trade decisions, with memory)
 """
 
 import json
@@ -18,17 +19,16 @@ from datetime import datetime
 import pytz
 from anthropic import Anthropic
 
-from config import Config
+from config import Config, conf_rank
 from portfolio import (
     load_portfolio, save_portfolio, execute_trade,
     snapshot_history, total_value, check_stop_losses,
-    update_holding_prices,
+    update_holding_prices, add_notification, win_rate,
 )
 from prices import (
     update_all_holding_prices, get_price_history,
-    compute_technicals, get_bulk_prices,
+    compute_technicals, get_bulk_prices, compute_regime,
 )
-from notifier import send_cycle_summary
 
 log = logging.getLogger("daedalus.agents")
 AEST = pytz.timezone("Australia/Sydney")
@@ -350,6 +350,45 @@ def run_technical_analyst(config: Config, portfolio: dict, analyst_data: dict) -
     return result
 
 
+# ── Agent 3b: Market Regime (local — ASX index) ──────────────────────────────
+
+def run_market_regime(config: Config, portfolio: dict, tech_data: dict,
+                      news_data: dict | None) -> dict:
+    """
+    Self-contained ASX market-regime read (the free-data adaptation of the SPX
+    GEX 'which regime / is it safe to enter today' concept). No Claude call.
+
+    Uses the ASX200 index price action + realised volatility, breadth from the
+    technicals we already computed, and today's news sentiment.
+    """
+    log.info("▶ Market Regime — reading ASX index conditions...")
+
+    # Breadth: fraction of tracked names trading above their SMA20.
+    technicals = (tech_data or {}).get("technicals", {})
+    above = [t.get("aboveSMA20") for t in technicals.values() if "aboveSMA20" in t]
+    breadth = (sum(1 for x in above if x) / len(above)) if above else None
+
+    sentiment_score = (news_data or {}).get("score") if news_data else None
+
+    history = get_price_history(config.ASX_INDEX_SYMBOL, days=120)
+    regime = compute_regime(history, breadth=breadth, sentiment_score=sentiment_score)
+
+    if regime.get("available"):
+        log.info(
+            f"  Regime: {regime['signal']} · {regime['posture']} · "
+            f"vol {regime['volRegime']} ({regime['volTrend']}) · trend {regime['trend']}"
+        )
+        add_notification(
+            portfolio, "REGIME",
+            f"Market regime: {regime['signal']} — {regime['posture']}",
+            regime["advice"],
+        )
+    else:
+        log.warning("  Regime: unavailable (insufficient index data)")
+
+    return regime
+
+
 # ── Agent 4: Earnings Calendar (Haiku) ───────────────────────────────────────
 
 def run_earnings_calendar(client: Anthropic, config: Config, portfolio: dict) -> dict:
@@ -559,12 +598,14 @@ def calculate_position_size(
     price: float,
     confidence: str,
     volatility: float | None,
-    min_shares: int,
+    min_value: float,
     max_position_value: float,
 ) -> int:
     """
     Calculate shares to buy based on confidence, volatility, and constraints.
-    Higher confidence + lower volatility = larger position.
+    Sizing is a % of available capital, so positions scale with the book and
+    the portfolio compounds as it grows. Higher confidence + lower volatility =
+    larger position. Enforces a minimum trade *value* (min_value AUD).
     """
     if price <= 0 or cash_available <= 0:
         return 0
@@ -572,7 +613,7 @@ def calculate_position_size(
     # Base allocation by confidence
     confidence_multiplier = {"HIGH": 1.0, "MEDIUM": 0.6, "LOW": 0.3}.get(confidence, 0.4)
 
-    # Volatility adjustment: higher vol = smaller position
+    # Volatility adjustment: higher vol = smaller position (% per period)
     vol_multiplier = 1.0
     if volatility and volatility > 0:
         if volatility > 5:
@@ -582,17 +623,21 @@ def calculate_position_size(
         elif volatility > 1.5:
             vol_multiplier = 0.85
 
-    # Target value for this position
+    # Target value for this position — deploy ~30% of free cash, scaled.
     target_value = cash_available * 0.30 * confidence_multiplier * vol_multiplier
-    target_value = min(target_value, max_position_value)
+    target_value = min(target_value, max_position_value, cash_available)
 
     shares = int(target_value / price)
-    if shares < min_shares:
-        # Check if we can even afford min_shares
-        if min_shares * price <= cash_available:
-            shares = min_shares
+
+    # Enforce the minimum trade *value*: bump up to the minimum if affordable.
+    if shares * price < min_value:
+        needed = int(min_value / price)
+        if needed * price < min_value:
+            needed += 1
+        if needed * price <= cash_available:
+            shares = needed
         else:
-            return 0  # Can't afford minimum
+            return 0  # Can't afford a meaningful position
 
     return shares
 
@@ -608,11 +653,14 @@ def run_portfolio_manager(
     tech_data: dict | None = None,
     earnings_data: dict | None = None,
     risk_data: dict | None = None,
+    regime_data: dict | None = None,
+    win_stats: dict | None = None,
 ) -> dict:
     """
     Synthesises all agent data and generates specific trade recommendations.
-    Has access to trade memory (past decisions), technicals, risk analysis,
-    and sentiment trend. No web search — uses the rich context already gathered.
+    Has access to trade memory (past decisions), technicals, market regime,
+    risk analysis, realised-P&L win rate, and sentiment trend. No web search —
+    uses the rich context already gathered.
     """
     log.info("▶ Portfolio Manager (Sonnet) — generating trade decisions...")
 
@@ -620,6 +668,8 @@ def run_portfolio_manager(
     current_val  = total_value(portfolio)
     pl_abs       = current_val - portfolio["startingCapital"]
     pl_pct       = (pl_abs / portfolio["startingCapital"]) * 100
+    regime       = regime_data or {}
+    win          = win_stats or {}
 
     holdings_summary = []
     for h in portfolio.get("holdings", []):
@@ -673,6 +723,8 @@ def run_portfolio_manager(
         "You are SECTOR-AGNOSTIC — follow the best opportunity regardless of sector. "
         "If insider selling is detected (CEO/directors selling large share parcels), treat "
         "this as a strong sell signal and recommend selling that position. "
+        "RESPECT THE MARKET REGIME: when the safe-to-enter signal is RED, hold cash and only "
+        "manage exits; when GREEN, deploy into the best opportunities. "
         "Respond ONLY with valid JSON — no markdown, no backticks, no preamble, no trailing text."
     )
 
@@ -728,11 +780,27 @@ RISK & REBALANCING:
   Take-profit alerts: {json.dumps((risk_data or {}).get('takeProfitAlerts', []))}
   Expired pending trades: {json.dumps((risk_data or {}).get('expiredTrades', []))}
 
+MARKET REGIME (ASX200 — free-data GEX analog; positive/mean-reverting = safer, trending/volatile = riskier):
+  Safe-to-enter signal: {regime.get('signal','N/A')} · Posture: {regime.get('posture','N/A')}
+  {regime.get('headline','')}
+  {regime.get('advice','')}
+  Vol regime: {regime.get('volRegime')} ({regime.get('volTrend')}) · Trend: {regime.get('trend')} · Breadth: {regime.get('breadthPct')}%
+  Key ASX200 levels — support {regime.get('support')} / resistance {regime.get('resistance')} (last {regime.get('price')})
+
+YOUR TRACK RECORD (realised, closed trades — learn from it):
+  Win rate: {win.get('winRate')}% ({win.get('wins')}W / {win.get('losses')}L) · Realised P&L: ${win.get('realizedPnL')}
+
 TRADING RULES:
   - Keep ≥ ${cash_buffer:.2f} cash buffer at all times
   - Maximum 2–3 trades per cycle (don't over-trade)
-  - MINIMUM TRADE SIZE: {config.MIN_TRADE_SHARES} shares per trade. Do NOT buy fewer than {config.MIN_TRADE_SHARES} shares
-    of any stock. If you can't afford {config.MIN_TRADE_SHARES} shares, skip that stock.
+  - MARKET REGIME GATE: If the safe-to-enter signal is RED, do NOT open new BUYs — manage
+    exits and hold cash. If AMBER, be selective and favour pullbacks with reduced size.
+    If GREEN, deploy into the best opportunities.
+  - POSITION SIZE for BUYs is finalised automatically by the system (confidence- and
+    volatility-scaled as a % of capital). NO small increments: every trade is at least
+    the greater of ${config.MIN_TRADE_VALUE:.0f} or {config.MIN_TRADE_PCT*100:.0f}% of the book, and
+    at most {config.MAX_POSITION_PCT*100:.0f}%. Provide a reasonable share estimate, but focus on
+    WHICH stocks and your conviction — don't fragment capital into tiny positions.
   - Only BUY stocks with HIGH or MEDIUM analyst confidence
   - BUY LOW, SELL HIGH: Favour stocks trading below their recent highs with strong fundamentals.
     Avoid chasing stocks at peak prices. Sell holdings that have appreciated significantly.
@@ -752,7 +820,7 @@ TRADING RULES:
   - Be SECTOR-AGNOSTIC: invest in the best opportunities regardless of sector
   - CONCENTRATION: If any position exceeds {config.MAX_POSITION_PCT*100:.0f}% of portfolio, reduce it
   - Consider manual holdings: monitor and flag concerns, but let the investor decide
-  - Calculate exact share counts (integer ≥ {config.MIN_TRADE_SHARES}) from available cash and analyst prices
+  - Provide integer share estimates from available cash and analyst prices (the system re-sizes BUYs)
 
 Return ONLY this JSON:
 {{
@@ -792,17 +860,17 @@ Return ONLY this JSON:
 def run_cycle(config: Config) -> None:
     """
     Run a complete agent cycle:
-      0. Fetch real prices via Yahoo Finance + check stop-losses
-      1. Corporate Analyst  (Haiku + web search)
-      2. News Intelligence  (Haiku + web search)
-      3. Technical Analyst  (local — Yahoo Finance indicators)
-      4. Earnings Calendar  (Haiku + web search)
-      5. Risk & Rebalancing (local — concentration, trailing stops, take-profit)
-      6. Portfolio Manager  (Sonnet, no search, full synthesis)
-      7. Execute / queue trades
-      8. Update trade memory + sentiment history
-      9. Persist state + snapshot history
-     10. Send email notification
+      0.  Fetch real prices via Yahoo Finance + check stop-losses
+      1.  Corporate Analyst   (Haiku + web search)
+      2.  News Intelligence   (Haiku + web search)
+      3.  Technical Analyst   (local — Yahoo Finance indicators)
+      3b. Market Regime       (local — ASX200 regime + safe-to-enter signal)
+      4.  Earnings Calendar   (Haiku + web search)
+      5.  Risk & Rebalancing  (local — concentration, trailing stops, take-profit trim)
+      6.  Portfolio Manager   (Opus, no search, full synthesis)
+      7.  Size + execute / queue trades (auto-approve ≥ threshold)
+      8.  Update trade memory + sentiment history
+      9.  Cycle-summary notification + persist state + snapshot history
     """
     now = datetime.now(AEST)
     log.info(f"{'═'*60}")
@@ -812,15 +880,17 @@ def run_cycle(config: Config) -> None:
     client    = Anthropic(api_key=config.ANTHROPIC_API_KEY)
     portfolio = load_portfolio(config)
 
-    errors           = []
-    analyst_data     = None
-    news_data        = None
-    tech_data        = None
-    earnings_data    = None
-    risk_data        = None
-    pm_data          = None
-    stop_loss_sells  = []
-    trailing_sells   = []
+    errors            = []
+    analyst_data      = None
+    news_data         = None
+    tech_data         = None
+    regime_data       = None
+    earnings_data     = None
+    risk_data         = None
+    pm_data           = None
+    stop_loss_sells   = []
+    trailing_sells    = []
+    take_profit_sells = []
 
     # Update cycle health counter
     portfolio.setdefault("cycleHealth", {
@@ -907,6 +977,22 @@ def run_cycle(config: Config) -> None:
         log.warning(f"Technical Analyst failed (non-critical): {exc}")
         errors.append(f"Technical: {exc}")
 
+    # ── Step 3b: Market Regime (local — ASX index) ────────────────────────
+    try:
+        regime_data = run_market_regime(config, portfolio, tech_data or {}, news_data)
+        portfolio["lastRegime"] = regime_data
+        if regime_data.get("available"):
+            portfolio.setdefault("logs", []).insert(0, {
+                "ts": now.isoformat(),
+                "agent": "Market Regime",
+                "type": "REGIME",
+                "title": f"Regime {regime_data['signal']} — {regime_data['posture']}",
+                "content": regime_data.get("advice", ""),
+            })
+    except Exception as exc:
+        log.warning(f"Market Regime failed (non-critical): {exc}")
+        errors.append(f"Regime: {exc}")
+
     # ── Step 4: Earnings Calendar ─────────────────────────────────────────
     log.info("Pausing 65s between agents to respect rate limits…")
     time.sleep(65)
@@ -955,6 +1041,35 @@ def run_cycle(config: Config) -> None:
                     log.warning(f"  TRAILING-STOP: Sold {ticker} ({alert['dropFromPeak']:.1f}% from peak)")
                     errors.append(f"TRAILING-STOP: Sold {ticker}")
 
+        # Auto-trim take-profit winners to lock in gains and free cash to
+        # compound — unless the index is in a strong uptrend (let winners run).
+        strong_uptrend = (regime_data or {}).get("trend") == "TRENDING_UP"
+        if not strong_uptrend:
+            for alert in risk_data.get("takeProfitAlerts", []):
+                ticker = alert["ticker"]
+                holding = next((h for h in portfolio["holdings"] if h["ticker"] == ticker), None)
+                if not holding:
+                    continue
+                trim = max(1, int(holding["shares"] * config.TAKE_PROFIT_TRIM_PCT))
+                trade = {
+                    "ticker": ticker,
+                    "name": holding["name"],
+                    "action": "SELL",
+                    "shares": trim,
+                    "price": alert["currentPrice"],
+                    "total": round(trim * alert["currentPrice"], 2),
+                    "confidence": "HIGH",
+                    "reason": (f"Take-profit trim: up {alert['gainPct']:.1f}% — sold "
+                               f"{int(config.TAKE_PROFIT_TRIM_PCT*100)}% to lock in gains"),
+                }
+                result = execute_trade(portfolio, trade, source=holding.get("source", "agent"))
+                if result["success"]:
+                    take_profit_sells.append(trade)
+                    add_notification(portfolio, "TRADE",
+                                     f"Take-profit trim: {ticker} (+{alert['gainPct']:.1f}%)",
+                                     trade["reason"])
+                    log.info(f"  TAKE-PROFIT: Trimmed {trim}× {ticker} (+{alert['gainPct']:.1f}%)")
+
         portfolio.setdefault("logs", []).insert(0, {
             "ts": now.isoformat(),
             "agent": "Risk & Rebalancing",
@@ -977,6 +1092,8 @@ def run_cycle(config: Config) -> None:
                 tech_data=tech_data,
                 earnings_data=earnings_data,
                 risk_data=risk_data,
+                regime_data=regime_data,
+                win_stats=win_rate(portfolio),
             )
             portfolio["lastPMOutput"] = pm_data
             portfolio.setdefault("logs", []).insert(0, {
@@ -995,19 +1112,59 @@ def run_cycle(config: Config) -> None:
     executed_trades = []
     pending_trades  = []
 
+    book_value = total_value(portfolio)
+    max_position_value = round(book_value * config.MAX_POSITION_PCT, 2)
+    # No small increments: each trade must clear the GREATER of the dollar floor
+    # and a percentage of the whole book — scales with the account as it grows.
+    eff_min_value = max(config.MIN_TRADE_VALUE, round(book_value * config.MIN_TRADE_PCT, 2))
+    technicals = (tech_data or {}).get("technicals", {})
+
     for trade in trades:
-        confidence = trade.get("confidence", "")
+        confidence = str(trade.get("confidence", "")).upper()
+        action = str(trade.get("action", "")).upper()
+
+        # Deterministically size BUYs as a volatility-scaled % of capital, so
+        # positions stay affordable and the book compounds as it grows.
+        if action == "BUY":
+            try:
+                price = float(trade["price"])
+            except (TypeError, ValueError, KeyError):
+                log.warning(f"  Skipped {trade.get('ticker')}: invalid price")
+                continue
+            vol = (technicals.get(trade["ticker"]) or {}).get("volatility")
+            sized = calculate_position_size(
+                cash_available=portfolio["cash"],
+                price=price,
+                confidence=confidence,
+                volatility=vol,
+                min_value=eff_min_value,
+                max_position_value=max_position_value,
+            )
+            if sized <= 0:
+                log.info(
+                    f"  Skipped {trade['ticker']}: cannot size a "
+                    f"${eff_min_value:.0f}+ position from ${portfolio['cash']:.2f} cash"
+                )
+                continue
+            trade["shares"] = sized
+            trade["total"] = round(sized * price, 2)
+
         should_auto = (
             config.AUTO_APPROVE_TRADES
-            and confidence == config.AUTO_APPROVE_MIN_CONFIDENCE
+            and conf_rank(confidence) >= conf_rank(config.AUTO_APPROVE_MIN_CONFIDENCE)
         )
 
         if should_auto:
             trade["autoApproved"] = True
             result = execute_trade(portfolio, trade, source="agent",
-                                   min_shares=config.MIN_TRADE_SHARES)
+                                   min_value=eff_min_value)
             if result["success"]:
                 executed_trades.append(trade)
+                add_notification(
+                    portfolio, "TRADE",
+                    f"{trade['action']} {trade['shares']}× {trade['ticker']} @ ${trade['price']:.2f}",
+                    trade.get("reason", ""),
+                )
                 log.info(
                     f"  AUTO-EXECUTED: {trade['action']} {trade['shares']}× "
                     f"{trade['ticker']} @ ${trade['price']:.2f} "
@@ -1019,6 +1176,11 @@ def run_cycle(config: Config) -> None:
         else:
             trade["createdAt"] = now.isoformat()  # For pending trade expiry
             pending_trades.append(trade)
+            add_notification(
+                portfolio, "TRADE",
+                f"Pending approval: {trade['action']} {trade['shares']}× {trade['ticker']}",
+                f"Confidence {confidence or '—'} — approve or reject in the dashboard",
+            )
             log.info(
                 f"  PENDING APPROVAL: {trade['action']} {trade['shares']}× "
                 f"{trade['ticker']} @ ${trade['price']:.2f} "
@@ -1063,6 +1225,20 @@ def run_cycle(config: Config) -> None:
         portfolio["cycleHealth"]["lastSuccess"] = now.isoformat()
         portfolio["cycleHealth"]["successStreak"] = portfolio["cycleHealth"].get("successStreak", 0) + 1
 
+    # Cycle-summary notification (replaces the old email report)
+    total_now = total_value(portfolio)
+    pl_now = total_now - portfolio["startingCapital"]
+    n_exec = (len(executed_trades) + len(stop_loss_sells)
+              + len(trailing_sells) + len(take_profit_sells))
+    regime_tag = (f" · regime {regime_data['signal']}"
+                  if (regime_data or {}).get("available") else "")
+    add_notification(
+        portfolio, "CYCLE",
+        f"Cycle complete — ${total_now:,.2f} "
+        f"({'+' if pl_now >= 0 else ''}{(pl_now / portfolio['startingCapital']) * 100:.2f}%)",
+        f"{n_exec} trade(s) executed, {len(pending_trades)} pending approval{regime_tag}",
+    )
+
     snapshot_history(portfolio)
     save_portfolio(portfolio, config)
 
@@ -1075,15 +1251,3 @@ def run_cycle(config: Config) -> None:
     )
     if errors:
         log.warning(f"Cycle completed with {len(errors)} note(s): {'; '.join(errors)}")
-
-    # ── Step 10: Email notification ───────────────────────────────────────
-    if config.NOTIFY_EMAIL:
-        try:
-            all_executed = executed_trades + stop_loss_sells + trailing_sells
-            send_cycle_summary(
-                config, portfolio,
-                analyst_data, news_data, pm_data,
-                all_executed, pending_trades, errors,
-            )
-        except Exception as exc:
-            log.error(f"Notification failed: {exc}", exc_info=True)

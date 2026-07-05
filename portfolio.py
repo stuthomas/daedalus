@@ -1,6 +1,6 @@
 """
 Daedalus Portfolio
-Manages portfolio state as a JSON file on the Railway volume.
+Manages portfolio state as a JSON file on the deployment volume.
 """
 
 import json
@@ -14,6 +14,11 @@ import pytz
 log = logging.getLogger("daedalus.portfolio")
 AEST = pytz.timezone("Australia/Sydney")
 
+# Cap on retained closed-trade records (dashboard history). Kept as a module
+# constant so execute_trade needn't take the Config object.
+_MAX_CLOSED_TRADES = 200
+_MAX_NOTIFICATIONS = 60
+
 
 # ── Initial state ─────────────────────────────────────────────────────────────
 
@@ -25,18 +30,26 @@ def _blank_portfolio(starting_capital: float) -> dict:
         "currency": "AUD",
         "holdings": [],
         "transactions": [],
+        "pendingTrades": [],
         "history": [
             {"date": today, "value": starting_capital, "cash": starting_capital, "invested": 0}
         ],
         "logs": [],
+        "notifications": [],
         "lastAnalysis": None,
         "lastNews": None,
         "lastPMOutput": None,
+        "lastRegime": None,
         "startDate": today,
         # Trade memory: last N PM decisions for context injection
         "tradeMemory": [],
         # Sentiment history: last N scores for trend analysis
         "sentimentHistory": [],
+        # Realised-P&L / win-rate tracking (learning signal + dashboard)
+        "closedTrades": [],
+        "realizedPnL": 0.0,
+        "wins": 0,
+        "losses": 0,
         # Cycle health tracking
         "cycleHealth": {
             "lastSuccess": None,
@@ -45,7 +58,7 @@ def _blank_portfolio(starting_capital: float) -> dict:
             "totalCycles": 0,
             "totalErrors": 0,
         },
-        "version": "2.0",
+        "version": "3.0",
     }
 
 
@@ -56,9 +69,16 @@ def load_portfolio(config) -> dict:
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # Migrate old portfolios missing new fields
+        # Migrate older portfolios missing newer fields
         data.setdefault("tradeMemory", [])
         data.setdefault("sentimentHistory", [])
+        data.setdefault("pendingTrades", [])
+        data.setdefault("notifications", [])
+        data.setdefault("closedTrades", [])
+        data.setdefault("realizedPnL", 0.0)
+        data.setdefault("wins", 0)
+        data.setdefault("losses", 0)
+        data.setdefault("lastRegime", None)
         data.setdefault("cycleHealth", {
             "lastSuccess": None, "lastFailure": None,
             "successStreak": 0, "totalCycles": 0, "totalErrors": 0,
@@ -78,6 +98,23 @@ def save_portfolio(portfolio: dict, config) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(portfolio, f, indent=2, ensure_ascii=False)
     log.debug(f"Portfolio saved to {path}")
+
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+def add_notification(portfolio: dict, kind: str, title: str, detail: str = "") -> None:
+    """
+    Append an in-app notification (replaces email). kind is a semantic tag the
+    dashboard styles: TRADE | ALERT | REGIME | CYCLE | INFO.
+    """
+    notes = portfolio.setdefault("notifications", [])
+    notes.insert(0, {
+        "ts": datetime.now(AEST).isoformat(),
+        "kind": kind,
+        "title": title,
+        "detail": detail,
+    })
+    portfolio["notifications"] = notes[:_MAX_NOTIFICATIONS]
 
 
 # ── Add Funds ─────────────────────────────────────────────────────────────────
@@ -117,19 +154,53 @@ def add_funds(portfolio: dict, amount: float) -> dict:
         "title": f"Funds added: ${amount:.2f} AUD",
         "content": f"Cash balance is now ${portfolio['cash']:.2f} AUD",
     })
+    add_notification(portfolio, "INFO", f"Funds added: ${amount:.2f} AUD",
+                     f"Cash balance is now ${portfolio['cash']:.2f} AUD")
 
     log.info(f"Funds added: ${amount:.2f} AUD → cash now ${portfolio['cash']:.2f}")
     return {"success": True, "error": None, "newCash": portfolio["cash"]}
 
 
+# ── Realised P&L ──────────────────────────────────────────────────────────────
+
+def _record_closed_trade(portfolio: dict, holding: dict, shares_sold: int,
+                         sell_price: float, reason: str, source: str) -> float:
+    """Record realised P&L for a (partial) SELL and update win/loss stats."""
+    avg = holding.get("avgBuyPrice", sell_price)
+    realized = round((sell_price - avg) * shares_sold, 2)
+    realized_pct = round(((sell_price - avg) / avg) * 100, 2) if avg > 0 else 0.0
+
+    portfolio["realizedPnL"] = round(portfolio.get("realizedPnL", 0.0) + realized, 2)
+    if realized > 0:
+        portfolio["wins"] = portfolio.get("wins", 0) + 1
+    elif realized < 0:
+        portfolio["losses"] = portfolio.get("losses", 0) + 1
+
+    closed = portfolio.setdefault("closedTrades", [])
+    closed.insert(0, {
+        "ts": datetime.now(AEST).isoformat(),
+        "ticker": holding["ticker"],
+        "name": holding.get("name", holding["ticker"]),
+        "shares": shares_sold,
+        "avgBuyPrice": round(avg, 4),
+        "sellPrice": round(sell_price, 4),
+        "realizedPnL": realized,
+        "realizedPct": realized_pct,
+        "reason": reason,
+        "source": source,
+    })
+    portfolio["closedTrades"] = closed[:_MAX_CLOSED_TRADES]
+    return realized
+
+
 # ── Trade Execution ───────────────────────────────────────────────────────────
 
 def execute_trade(portfolio: dict, trade: dict, source: str = "agent",
-                  min_shares: int = 0) -> dict:
+                  min_value: float = 0.0) -> dict:
     """
     Execute a BUY or SELL trade against the portfolio.
     source: "agent" | "manual"
-    min_shares: minimum shares per BUY trade (0 = no minimum, set from config.MIN_TRADE_SHARES)
+    min_value: minimum AUD value per agent BUY trade (0 = no minimum).
     Returns {"success": bool, "error": str | None}.
     Modifies `portfolio` in place on success.
     """
@@ -140,14 +211,16 @@ def execute_trade(portfolio: dict, trade: dict, source: str = "agent",
     total  = round(shares * price, 4)
     today  = datetime.now(AEST).strftime("%Y-%m-%d")
 
-    # Enforce minimum trade size for agent BUY orders (manual trades exempt)
-    if action == "BUY" and source == "agent" and min_shares > 0 and shares < min_shares:
+    # Enforce minimum trade *value* for agent BUY orders (manual trades exempt).
+    if action == "BUY" and source == "agent" and min_value > 0 and total < min_value:
         return {
             "success": False,
-            "error": f"Below minimum trade size: {shares} shares < {min_shares} minimum",
+            "error": f"Below minimum trade value: ${total:.2f} < ${min_value:.2f} minimum",
         }
 
     if action == "BUY":
+        if shares <= 0:
+            return {"success": False, "error": "Share count must be positive"}
         if total > portfolio["cash"] + 0.01:
             return {
                 "success": False,
@@ -185,6 +258,14 @@ def execute_trade(portfolio: dict, trade: dict, source: str = "agent",
         selling = min(shares, existing["shares"])
         proceeds = round(selling * price, 4)
         portfolio["cash"] = round(portfolio["cash"] + proceeds, 4)
+
+        # Record realised P&L before mutating/removing the holding.
+        _record_closed_trade(portfolio, existing, selling, price,
+                             trade.get("reason", ""), existing.get("source", source))
+
+        # Reflect the actual number of shares sold in the transaction record.
+        shares = selling
+        total = proceeds
 
         if existing["shares"] - selling <= 0:
             portfolio["holdings"] = [h for h in portfolio["holdings"] if h["ticker"] != ticker]
@@ -267,6 +348,8 @@ def check_stop_losses(portfolio: dict, config) -> list[dict]:
             result = execute_trade(portfolio, trade, source=holding.get("source", "agent"))
             if result["success"]:
                 triggered.append(trade)
+                add_notification(portfolio, "ALERT", f"Stop-loss: sold {holding['ticker']}",
+                                 trade["reason"])
                 log.warning(
                     f"STOP-LOSS: Sold {holding['shares']}× {holding['ticker']} "
                     f"@ ${current:.2f} (dropped {drop_pct*100:.1f}%)"
@@ -343,3 +426,17 @@ def total_value(portfolio: dict) -> float:
         for h in portfolio.get("holdings", [])
     )
     return round(portfolio["cash"] + invested, 2)
+
+
+def win_rate(portfolio: dict) -> dict:
+    """Return {wins, losses, total, winRate} from closed-trade stats."""
+    wins = portfolio.get("wins", 0)
+    losses = portfolio.get("losses", 0)
+    total = wins + losses
+    return {
+        "wins": wins,
+        "losses": losses,
+        "total": total,
+        "winRate": round((wins / total) * 100, 1) if total else None,
+        "realizedPnL": round(portfolio.get("realizedPnL", 0.0), 2),
+    }

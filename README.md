@@ -1,242 +1,154 @@
-# Daedalus — ASX Portfolio AI Daemon
+# Daedalus — Autonomous ASX Portfolio AI
 
-Autonomous background service that runs three Claude-powered agents during ASX market hours to monitor, analyse, and manage a paper trading portfolio.
+A self-contained background service that runs a team of Claude-powered agents during
+ASX market hours to analyse, decide, and **autonomously trade** a paper portfolio — plus
+a full-page dashboard (dark/light) served by the same app.
 
 ```
-  Corporate Analyst (Haiku)     News Intelligence (Haiku)
-         │                               │
-         └──────────────┬────────────────┘
-                        ▼
-              Portfolio Manager (Sonnet)
-                        │
-              ┌─────────┴──────────┐
-              │                    │
-         Email Report       Portfolio State
-           (Gmail)           (JSON + API)
+ Corporate Analyst (Haiku)   News Intelligence (Haiku)   Technical Analyst (local)
+          │                          │                          │
+          └───────────┬──────────────┴───────────┬──────────────┘
+                       ▼                          ▼
+              Market Regime (local)       Earnings Calendar (Haiku)
+                       │                          │
+                       └────────────┬─────────────┘
+                                    ▼
+                        Risk & Rebalancing (local)
+                                    ▼
+                    Portfolio Manager (Opus 4.8)  ──►  auto-executes trades
+                                    ▼
+                    Portfolio state (JSON)  +  Dashboard (served at /)
 ```
 
----
-
-## Features
-
-- **Three AI agents** running in sequence each cycle
-- **Haiku** for the two search-heavy agents (cost-efficient)
-- **Sonnet** for the Portfolio Manager (better reasoning)
-- **ASX market hours only** — 10am, 12pm, 2pm AEST Mon–Fri by default
-- **REST API** — dashboard artifact can sync portfolio state in real time
-- **Email reports** — styled HTML after every cycle (optional)
-- **Manual or auto-approve** trades — you stay in control
-- Deploys to **Railway** or **Render** in under 10 minutes
+Everything runs on just two things: the **Anthropic API** and **free Yahoo Finance**
+data. No email, no broker keys, no paid market-data feeds.
 
 ---
 
-## Estimated Cost
+## What it does
 
-| Component | Cost (AUD/month) |
-|---|---|
-| Railway Hobby or Render Starter | ~$8–11 |
-| Anthropic API (Haiku × 2 + Sonnet × 1, 3 cycles/day, trading days) | ~$3–5 |
-| **Total** | **~$11–16 / month** |
+- **7 agents per cycle.** Two search agents (Haiku) discover opportunities and news; a
+  local Technical Analyst computes indicators from Yahoo Finance; a **Market Regime**
+  module reads the ASX 200 ("is it safe to enter today?"); a local Risk agent handles
+  concentration, trailing stops and take-profit; the **Portfolio Manager (Opus 4.8)**
+  synthesises everything and decides trades.
+- **Fully autonomous.** By default every trade the PM decides is executed automatically
+  within the risk limits — the paper portfolio runs and grows on its own. (You can flip
+  a switch to require dashboard approval instead.)
+- **Grows sensibly.** Positions are sized as a volatility-scaled % of capital, so the book
+  compounds as it grows. There are **no small increments** — every trade is at least the
+  greater of `$MIN_TRADE_VALUE` or `MIN_TRADE_PCT` of the whole book, and at most
+  `MAX_POSITION_PCT`. Winners are trimmed on take-profit to lock in gains and recycle cash.
+- **Market Regime gate.** Entries are gated on a free-data adaptation of the SPX GEX
+  "regime / safe-to-enter" idea: realised-volatility regime, trend vs mean-reversion,
+  breadth and news sentiment produce a GREEN / AMBER / RED signal on the ASX 200.
+- **Learning.** Realised P&L, win rate and closed trades feed back into the PM's context.
+- **Dashboard included.** A responsive app-shell dashboard (charts, allocation, regime
+  gauge, holdings, activity) with a dark/light toggle, served by the daemon at `/`.
 
 ---
 
-## Quick Start (local)
-
-### 1. Clone and install
+## Quick start (local)
 
 ```bash
-git clone <your-repo>
-cd daedalus
+git clone https://github.com/stuthomas/Daedalus.git
+cd Daedalus
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+.venv\Scripts\activate           # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-```
 
-### 2. Configure
-
-```bash
-cp .env.example .env
-# Edit .env — add your ANTHROPIC_API_KEY at minimum
-```
-
-### 3. Run
-
-```bash
+cp .env.example .env             # then edit .env — add your ANTHROPIC_API_KEY
 python main.py
 ```
 
-Daedalus will start the API server on port 8080 and wait for the next scheduled market-hours cycle. To trigger one immediately for testing:
+Open **http://localhost:8080/** for the dashboard. Trigger a cycle immediately:
 
 ```bash
-curl -X POST http://localhost:8080/api/trigger
-# If DAEDALUS_API_KEY is set:
-curl -X POST http://localhost:8080/api/trigger -H "X-API-Key: your_key"
+curl -X POST http://localhost:8080/api/trigger        # add -H "X-API-Key: <key>" if set
 ```
 
 ---
 
-## Deploy to Railway
+## Deploy to Railway — single repo
 
-### 1. Push to GitHub
+Everything lives in **one repo** now. The daemon serves the API **and** the dashboard,
+so you no longer need a separate `daedalus-dashboard` project.
 
-```bash
-git init
-git add .
-git commit -m "init daedalus"
-gh repo create daedalus --private --push --source=.
-```
-
-### 2. Create Railway project
-
-1. Go to [railway.com](https://railway.com) → **New Project** → **Deploy from GitHub repo**
-2. Select your `daedalus` repository
-3. Railway auto-detects the `Procfile` and starts a web service
-
-### 3. Add environment variables
-
-In Railway → your service → **Variables**, add:
-
-```
-ANTHROPIC_API_KEY    = sk-ant-...
-DAEDALUS_API_KEY     = (generate a random string, e.g. openssl rand -hex 32)
-NOTIFY_EMAIL         = you@email.com.au    (optional)
-SMTP_USER            = you@gmail.com       (optional)
-SMTP_PASS            = your-app-password   (optional)
-```
-
-Leave all other vars at defaults unless you want to customise the schedule.
-
-### 4. Add a Volume (for portfolio persistence)
-
-Railway filesystem resets on each deploy unless you use a Volume.
-
-1. Railway → your project → **+ New** → **Volume**
-2. Mount path: `/data`
-3. In Variables, add: `PORTFOLIO_FILE=/data/portfolio.json`
-
-Your portfolio now survives redeploys. ✓
-
-### 5. Get your public URL
-
-Railway → your service → **Settings** → **Networking** → Generate Domain.
-
-Your Daedalus API will be at: `https://your-app.up.railway.app`
+1. **Push everything to `stuthomas/Daedalus`:**
+   ```bash
+   git add .
+   git commit -m "Autonomous rebuild + dashboard"
+   git push origin main
+   ```
+2. Railway auto-detects the `Procfile` (`web: python main.py`) and deploys. Your dashboard
+   is then live at your Railway URL (e.g. `https://<app>.up.railway.app/`) — same origin as
+   the API, so the dashboard needs no configuration.
+3. **Keep your existing portfolio.** Add a **Volume** mounted at `/data` and set
+   `PORTFOLIO_FILE=/data/portfolio.json` in Variables. Code deploys never touch the Volume,
+   and the loader migrates older portfolios automatically (new fields are added on load), so
+   your status, holdings and history are preserved across the upgrade.
+4. Set the other Variables you want (`DAEDALUS_API_KEY`, risk knobs, etc.).
+5. **Retire the old dashboard service.** The separate `daedalus-dashboard` static site is
+   redundant — you can delete that Railway service and repo. (If you'd rather keep hosting
+   the dashboard separately, open its **Settings** gear and set the API base URL to your
+   Railway API URL + the API key.)
 
 ---
 
-## Deploy to Render
-
-### 1. Push to GitHub (same as Railway step 1)
-
-### 2. Create Render web service
-
-1. Go to [render.com](https://render.com) → **New** → **Web Service**
-2. Connect your GitHub repo
-3. Settings:
-   - **Runtime**: Python 3
-   - **Build command**: `pip install -r requirements.txt`
-   - **Start command**: `python main.py`
-
-### 3. Add environment variables
-
-In Render → your service → **Environment**, add the same vars as above.
-
-### 4. Add a Disk (for portfolio persistence)
-
-1. Render → your service → **Disks** → **Add Disk**
-2. Mount path: `/data`, Size: 1 GB (free tier)
-3. In Environment, add: `PORTFOLIO_FILE=/data/portfolio.json`
-
-### 5. Deploy
-
-Click **Deploy** — Render will build and start Daedalus.
-
-Your public URL: `https://your-app.onrender.com`
-
----
-
-## API Reference
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/health` | GET | Health check — returns `{"status":"ok"}` |
-| `/api/status` | GET | Portfolio summary + next cycle times |
-| `/api/portfolio` | GET | Full portfolio (no cached agent outputs) |
-| `/api/portfolio/full` | GET | Full portfolio including last agent outputs |
-| `/api/trigger` | POST | Manually trigger an agent cycle |
-
-**Trigger requires `X-API-Key` header** if `DAEDALUS_API_KEY` is set.
-
----
-
-## Connect the Dashboard Artifact
-
-The Daedalus dashboard artifact (apex-portfolio.jsx) can be updated to sync with this daemon.
-
-In the artifact, paste your Daedalus URL into the **Connect to Daemon** field. The dashboard will:
-- Pull the live portfolio state every 60 seconds
-- Display agent activity from the daemon's log
-- Allow you to approve/reject pending trades (which it then POSTs back via `/api/trigger`)
-
----
-
-## Configuration Reference
+## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | required | Your Anthropic API key |
-| `ANALYST_MODEL` | `claude-haiku-4-5-20251001` | Model for Corporate Analyst |
-| `NEWS_MODEL` | `claude-haiku-4-5-20251001` | Model for News Intelligence |
-| `PM_MODEL` | `claude-sonnet-4-6` | Model for Portfolio Manager |
-| `STARTING_CAPITAL` | `1000` | Paper trading starting capital (AUD) |
-| `PORTFOLIO_FILE` | `portfolio.json` | Path to portfolio state file |
-| `CASH_BUFFER_PCT` | `0.10` | Minimum cash reserve (10%) |
+| `ANTHROPIC_API_KEY` | _required_ | Your Anthropic API key |
+| `ANALYST_MODEL` / `NEWS_MODEL` | `claude-haiku-4-5` | Search agents (cheap) |
+| `PM_MODEL` | `claude-opus-4-8` | Portfolio Manager (most capable) |
+| `STARTING_CAPITAL` | `1000` | Paper starting capital (AUD) |
+| `PORTFOLIO_FILE` | `portfolio.json` | State file (use `/data/...` on Railway) |
+| `CASH_BUFFER_PCT` | `0.10` | Minimum cash reserve |
+| `STOP_LOSS_PCT` | `0.06` | Fixed stop-loss from avg buy |
+| `TRAILING_STOP_PCT` | `0.10` | Trailing stop from peak |
+| `TAKE_PROFIT_PCT` | `0.25` | Gain that triggers a take-profit trim |
+| `TAKE_PROFIT_TRIM_PCT` | `0.5` | Fraction sold on take-profit |
+| `MAX_POSITION_PCT` | `0.25` | Max single position |
+| `MAX_SECTOR_PCT` | `0.40` | Max single sector |
+| `MIN_TRADE_VALUE` | `150` | Absolute minimum trade value (AUD) |
+| `MIN_TRADE_PCT` | `0.08` | Minimum trade as % of book (no small increments) |
+| `ASX_INDEX_SYMBOL` | `^AXJO` | Index for the regime read |
 | `CYCLE_HOURS` | `10,12,14` | AEST hours to run cycles (Mon–Fri) |
-| `RUN_ON_STARTUP` | `false` | Run a cycle on startup if market is open |
-| `DAEDALUS_API_KEY` | _(blank)_ | Protects `/api/trigger` endpoint |
-| `AUTO_APPROVE_TRADES` | `false` | Auto-execute HIGH confidence trades |
-| `AUTO_APPROVE_MIN_CONFIDENCE` | `HIGH` | Minimum confidence for auto-execution |
-| `NOTIFY_EMAIL` | _(blank)_ | Email address for cycle reports |
-| `SMTP_USER` | _(blank)_ | Gmail address (sender) |
-| `SMTP_PASS` | _(blank)_ | Gmail App Password |
+| `RUN_ON_STARTUP` | `false` | Run a cycle on startup if market open |
+| `AUTO_APPROVE_TRADES` | `true` | Execute trades automatically |
+| `AUTO_APPROVE_MIN_CONFIDENCE` | `LOW` | Min confidence to auto-execute (`LOW` = all) |
+| `DAEDALUS_API_KEY` | _(blank)_ | Protects POST endpoints |
 
 ---
 
-## Email Notifications Setup
+## API reference
 
-1. Enable **2-Step Verification** on your Gmail account
-2. Go to **Google Account → Security → App Passwords**
-3. Create a new App Password (name it "Daedalus")
-4. Copy the 16-character password into `SMTP_PASS`
+| Endpoint | Method | Description |
+|---|---|---|
+| `/` , `/dashboard` | GET | The dashboard (served by the daemon) |
+| `/health` | GET | Health check |
+| `/api/status` | GET | Summary + regime + win rate + config |
+| `/api/portfolio/full` | GET | Full portfolio state (what the dashboard reads) |
+| `/api/trigger` | POST | Run an agent cycle now |
+| `/api/portfolio/add-funds` | POST | Add cash `{ "amount": 500 }` |
+| `/api/portfolio/manual-trade` | POST | Enter a trade manually |
+| `/api/portfolio/approve-trade` | POST | Approve a pending trade `{ "ticker": "BHP.AX" }` |
+| `/api/portfolio/reject-trade` | POST | Reject a pending trade |
 
-You'll receive a styled HTML email after every agent cycle showing trades, holdings, P&L, analyst recommendations, and market news.
-
----
-
-## ASX Market Hours
-
-Daedalus only runs during ASX trading hours: **Monday–Friday, 10:00am–4:00pm AEST**.
-
-The daemon uses `Australia/Sydney` timezone, which automatically handles AEST (UTC+10) / AEDT (UTC+11) daylight saving transitions.
-
-**Default cycle schedule**: 10:00am, 12:00pm, 2:00pm AEST — chosen to capture the open, midday, and pre-close windows.
-
-To change: `CYCLE_HOURS=10,13,15` (or any combination of hours between 10 and 15).
+POST endpoints require `X-API-Key` if `DAEDALUS_API_KEY` is set.
 
 ---
 
-## Roadmap: Going Live with Real Money
+## Market hours
 
-When your paper trading trial is complete and you're ready to trade with real money, the next step is integrating a broker API. Options for Australian investors:
-
-- **Interactive Brokers (IBKR)** — has a full Python API (`ib_insync`). Supports ASX. Best option for automation.
-- **SelfWealth** — no public API yet, but being developed
-- **CommSec** — no public API (as of 2026). Would require browser automation via Playwright, which is fragile and against their ToS.
-
-IBKR is strongly recommended for automated trading. The Portfolio Manager's trade output maps cleanly to IBKR order objects.
+Daedalus runs Monday–Friday during ASX hours (`Australia/Sydney`, auto-handles AEST/AEDT).
+Default cycles: 10:00, 12:00, 14:00 AEST — open, midday, pre-close.
 
 ---
 
 ## Disclaimer
 
-Daedalus is a paper trading simulation for educational and research purposes. Nothing it produces constitutes financial advice. All trades are simulated. Past paper trading performance does not predict real-market results. Always consult a licensed financial advisor before investing real money.
+Daedalus is a **paper trading simulation** for educational and research purposes. Nothing
+it produces is financial advice. All trades are simulated. Past paper performance does not
+predict real-market results. Consult a licensed financial adviser before investing real money.
