@@ -344,13 +344,22 @@
 </div>
 
 <script>
-// ── Config: same-origin by default; existing key retained; localStorage override ──
-const DEFAULT_API = '';  // '' → same origin (single-repo daemon serves this dashboard)
+// ── Config ────────────────────────────────────────────────────────────────────────
+// The API lives on Railway. When the dashboard is served by the daemon itself
+// (same origin) that URL is used; when it's hosted elsewhere (e.g. GitHub Pages)
+// or run locally, we fall back sensibly. Override any of this in Settings.
+const DEFAULT_API = 'https://web-production-9cb0e.up.railway.app';  // your Railway API
 const DEFAULT_KEY = '5d5b875a-ecc0-491c-a077-1742275b672d';
 const CFG = { refresh: 30 };
+function apiFallback(){
+  const h = window.location.hostname;
+  const local = (h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0' || h === '');
+  // Served by the daemon (same origin has the API) → use it; else the Railway URL.
+  return local ? window.location.origin : DEFAULT_API;
+}
 (function loadCfg(){
   let s = {}; try { s = JSON.parse(localStorage.getItem('daedalus.cfg') || '{}'); } catch(e){}
-  CFG.url = (s.url && s.url.trim()) ? s.url.trim().replace(/\/$/, '') : (DEFAULT_API || window.location.origin);
+  CFG.url = (s.url && s.url.trim()) ? s.url.trim().replace(/\/$/, '') : apiFallback();
   CFG.apiKey = (s.apiKey != null && s.apiKey !== '') ? s.apiKey : DEFAULT_KEY;
 })();
 
@@ -382,7 +391,7 @@ function toggleTheme(){ applyTheme(document.documentElement.getAttribute('data-t
 // ── Settings ────────────────────────────────────────────────────────────────────────
 function toggleSettings(){ const e=$('settings'); e.classList.toggle('open'); if(e.classList.contains('open')){ let s={}; try{s=JSON.parse(localStorage.getItem('daedalus.cfg')||'{}');}catch(x){} $('cfgUrl').value=s.url||''; $('cfgKey').value=s.apiKey||''; } }
 function saveSettings(){ localStorage.setItem('daedalus.cfg', JSON.stringify({url:$('cfgUrl').value, apiKey:$('cfgKey').value}));
-  let s=JSON.parse(localStorage.getItem('daedalus.cfg')); CFG.url=(s.url&&s.url.trim())?s.url.trim().replace(/\/$/,''):(DEFAULT_API||window.location.origin); CFG.apiKey=(s.apiKey!=null&&s.apiKey!=='')?s.apiKey:DEFAULT_KEY; $('settings').classList.remove('open'); refresh(); }
+  let s=JSON.parse(localStorage.getItem('daedalus.cfg')); CFG.url=(s.url&&s.url.trim())?s.url.trim().replace(/\/$/,''):apiFallback(); CFG.apiKey=(s.apiKey!=null&&s.apiKey!=='')?s.apiKey:DEFAULT_KEY; $('settings').classList.remove('open'); refresh(); }
 
 // ── Charts ──────────────────────────────────────────────────────────────────────────
 function initCharts(){
