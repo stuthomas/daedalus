@@ -48,7 +48,7 @@ data. No email, no broker keys, no paid market-data feeds.
 
 ---
 
-## Quick start (local)
+## Quick start
 
 ```bash
 git clone https://github.com/stuthomas/Daedalus.git
