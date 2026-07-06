@@ -87,11 +87,15 @@ so you no longer need a separate `daedalus-dashboard` project.
    `PORTFOLIO_FILE=/data/portfolio.json` in Variables. Code deploys never touch the Volume,
    and the loader migrates older portfolios automatically (new fields are added on load), so
    your status, holdings and history are preserved across the upgrade.
-4. Set the other Variables you want (`DAEDALUS_API_KEY`, risk knobs, etc.).
+4. **Set your keys as Railway Variables** (never commit them):
+   - `ANTHROPIC_API_KEY` — required. The old key was leaked to GitHub and deactivated, so
+     generate a fresh one in the Anthropic Console and set it here.
+   - `DAEDALUS_API_KEY` — optional; protects the POST endpoints. If you set it, authorise the
+     dashboard once by opening it with `?key=YOUR_DAEDALUS_API_KEY` (stored in the browser,
+     never in the code). Plus any risk knobs you want to tune.
 5. **Retire the old dashboard service.** The separate `daedalus-dashboard` static site is
-   redundant — you can delete that Railway service and repo. (If you'd rather keep hosting
-   the dashboard separately, open its **Settings** gear and set the API base URL to your
-   Railway API URL + the API key.)
+   redundant — you can delete that Railway service and repo. (If you keep hosting the dashboard
+   separately, it already defaults to your Railway API URL; just open it with `?key=` once.)
 
 ---
 
